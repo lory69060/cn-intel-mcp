@@ -1,0 +1,17 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "cn-intel-mcp",
+	"main": "src/server.ts",
+	"compatibility_date": "2026-08-16",
+	"compatibility_flags": ["nodejs_compat"],
+	"kv_namespaces": [
+		{
+			"binding": "MCP_STATS",
+			"id": "0349c56aa1aa42a5b274c5e7b886b6a7"
+		},
+		{
+			"binding": "MCP_TOKENS",
+			"id": "8cfcb71c7dd14ae8915645fc87bac283"
+		}
+	]
+}
