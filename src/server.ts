@@ -7,7 +7,15 @@
  *   - 文章清单: https://lory69060.github.io/cn-intel-board/llms.txt
  *
  * 协议：MCP Streamable HTTP（createMcpHandler，官方 Agents SDK 无状态方案）
- * 鉴权：可选 Bearer Token（env MCP_ACCESS_TOKEN 未设置则开放）
+ *
+ * 鉴权四层（2026-10-20 重构，对齐线上已部署行为）：
+ *   admin  — env MCP_ACCESS_TOKEN（/stats、/admin 也仅此层）
+ *   pro    — KV token 池（SHA-256 哈希存储），日限 10000
+ *   free   — KV token 池，日限 100
+ *   anon   — /mcp 全只读工具匿名开放，tools/call 日限 100（KV key rl:anon:YYYY-MM-DD）
+ *   无效/过期 token 一律 401（不静默降级为匿名）
+ *
+ * 附加路由：/.well-known/glama.json（Glama claim，verified 基线；固化防 deploy 冲掉）
  */
 
 import { McpServer } from "@modelcontextprotocol/server";
@@ -27,25 +35,11 @@ async function cachedFetch(url: string): Promise<Response> {
   if (cached) return cached;
   const res = await fetch(url, { headers: { "User-Agent": "cn-intel-mcp-worker" } });
   if (res.ok) {
-    const copy = res.clone();
-    ctxWaitUntil(copy, url);
-    return res;
+    // 300s 过期：信号板每日批量验证后不会永久陈旧（旧版无 TTL，缓存不失效）
+    // workers-types 的 Cache.put 缺第三参类型，实际运行时支持 expirationTtl
+    ;(cache.put as (...a: unknown[]) => Promise<void>)(url, res.clone(), { expirationTtl: 300 }).catch(() => {});
   }
   return res;
-}
-
-function ctxWaitUntil(copy: Response, url: string) {
-  // 用 event.waitUntil 语义：这里直接放缓存，由外层 fetch 的 ctx 控制
-  void cachePut(copy, url);
-}
-
-async function cachePut(copy: Response, url: string) {
-  const cache = caches.default;
-  try {
-    await cache.put(url, copy);
-  } catch {
-    /* 缓存失败不影响主流程 */
-  }
 }
 
 async function fetchJson(url: string): Promise<any> {
@@ -59,6 +53,10 @@ async function fetchText(url: string): Promise<string> {
   if (!res.ok) throw new Error(`数据源 ${url} 返回 ${res.status}`);
   return res.text();
 }
+
+// ─── Glama claim 路由（2026-10-12 起固化，deploy 不会冲掉）───
+const GLAMA_CLAIM = "glama_claim_w3_Ss-2qR-Viv8QmonNlfXp0CLIhydKc";
+const GLAMA_CONNECTOR_URL = "https://glama.ai/mcp/connectors/dev.workers.lory69060.cn-intel-mcp/cn-intel-mcp";
 
 // ─── 行业关键词映射（与本地 Python 版一致）───────────────────
 const INDUSTRY_KEYWORDS: Record<string, { 专属: string[]; 通用: string[] }> = {
@@ -208,7 +206,7 @@ function createServer() {
     "get_track_record",
     {
       description:
-        "读取信号验证记录（track record）：命中率、已验证/待验证统计、每条信号从 predicted_on 到 verify_by 的结果。这是唯一用时间积累的资产——判断层的命中历史，LLM 无法生成。",
+        "读取信号验证记录（track record）：命中率、已验证/待验证统计、每条信号从 predicted_on 到 verify_by 的结果。这是唯一用时间积累的资产——判断层的命中历史，LLM 无法生成。Use when: 评估信号板可信度、查某行业历史命中率、复盘已兑现/落空案例。Use instead: 要当前信号清单用 read_signal_board；问判断层问题用 ask_edge；查财报追踪用 read_earnings_tracker。",
       inputSchema: {
         industry: z.string().optional().describe("按行业筛选命中率统计；不填则返回全量"),
         include_signals: z.boolean().optional().describe("是否包含每条信号的明细，默认 true"),
@@ -370,12 +368,13 @@ function createServer() {
   return server;
 }
 
-// ─── Token 权限体系（2026-08-16）────────────────────────────
-// 三层：admin（env MCP_ACCESS_TOKEN，全量）/ pro（付费）/ free（限频）
+// ─── Token 权限体系（2026-08-16 三层 → 2026-10-20 四层）──────
+// admin（env MCP_ACCESS_TOKEN，全量）/ pro（付费）/ free（限频）/ anon（/mcp 匿名开放，tools/call 限频）
 // 存储：KV 只存 token 的 SHA-256 哈希，不存明文
 const FREE_DAILY_LIMIT = 100;
 const PRO_DAILY_LIMIT = 10000;
-const PAID_TOOLS: string[] = []; // 未来付费工具白名单（实时信号/深度分析等，暂空）
+const ANON_DAILY_LIMIT = 100; // 匿名开放层日限（key: rl:anon:YYYY-MM-DD）
+const PAID_TOOLS: string[] = []; // 未来付费工具白名单（实时信号/深度分析等，暂空；anon 层不可用）
 
 async function sha256hex(s: string): Promise<string> {
   const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
@@ -392,27 +391,43 @@ interface TokenRecord {
   limit?: number; // 自定义日限额（覆盖默认）
 }
 
-async function resolveToken(env: any, authHeader: string) {
-  if (!authHeader.startsWith("Bearer ")) return null;
-  const token = authHeader.slice(7).trim();
-  if (env.MCP_ACCESS_TOKEN && token === env.MCP_ACCESS_TOKEN) {
-    return { tier: "admin", hash: "admin", limit: Infinity };
+// 四层访问判定：admin / token(free|pro) / anon / null（= 提供了无效或过期 token，401）
+type Access =
+  | { kind: "admin" }
+  | { kind: "token"; tier: "free" | "pro"; hash: string; limit: number }
+  | { kind: "anon" };
+
+async function resolveAccess(env: any, authHeader: string): Promise<Access | null> {
+  // 1) admin（env MCP_ACCESS_TOKEN）
+  if (env.MCP_ACCESS_TOKEN && authHeader === `Bearer ${env.MCP_ACCESS_TOKEN}`) {
+    return { kind: "admin" };
   }
-  if (!env.MCP_TOKENS) return null;
-  const hash = await sha256hex(token);
-  const raw = await env.MCP_TOKENS.get(`token:${hash}`);
-  if (!raw) return null;
-  try {
-    const rec: TokenRecord = JSON.parse(raw);
-    if (rec.expires && Date.now() > new Date(rec.expires).getTime()) return null;
-    return {
-      tier: rec.tier,
-      hash,
-      limit: rec.limit ?? (rec.tier === "pro" ? PRO_DAILY_LIMIT : FREE_DAILY_LIMIT),
-    };
-  } catch {
+  // 2) 带了 token：无效/过期/记录损坏 → 401（绝不静默降级为匿名）
+  const provided = authHeader.startsWith("Bearer ") && authHeader.slice(7).trim().length > 0;
+  if (provided) {
+    if (!env.MCP_TOKENS) return null;
+    const token = authHeader.slice(7).trim();
+    const hash = await sha256hex(token);
+    const raw = await env.MCP_TOKENS.get(`token:${hash}`);
+    if (raw) {
+      try {
+        const rec: TokenRecord = JSON.parse(raw);
+        if (!(rec.expires && Date.now() > new Date(rec.expires).getTime())) {
+          return {
+            kind: "token",
+            tier: rec.tier,
+            hash,
+            limit: rec.limit ?? (rec.tier === "pro" ? PRO_DAILY_LIMIT : FREE_DAILY_LIMIT),
+          };
+        }
+      } catch {
+        /* 记录损坏 → 401 */
+      }
+    }
     return null;
   }
+  // 3) 无 token → 匿名开放层（/mcp 全只读工具，tools/call 日限 ANON_DAILY_LIMIT）
+  return { kind: "anon" };
 }
 
 async function rateLimit(env: any, hash: string, limit: number): Promise<boolean> {
@@ -455,6 +470,15 @@ export default {
     // 健康检查
     if (url.pathname === "/" || url.pathname === "/health") {
       return json({ name: "cn-intel-mcp", status: "ok", endpoint: "/mcp", tools: 6 });
+    }
+
+    // Glama claim 路由（目录平台核验所有权）
+    if (url.pathname === "/.well-known/glama.json") {
+      return json({
+        claim: GLAMA_CLAIM,
+        url: GLAMA_CONNECTOR_URL,
+        verified: true,
+      });
     }
 
     // 用量统计（admin）
@@ -530,8 +554,8 @@ export default {
       const qToken = url.searchParams.get("token");
       if (qToken) effectiveAuth = `Bearer ${qToken}`;
     }
-    const tk = await resolveToken(env, effectiveAuth);
-    if (!tk) return new Response("Unauthorized", { status: 401 });
+    const access = await resolveAccess(env, effectiveAuth);
+    if (!access) return new Response("Unauthorized", { status: 401 });
 
     // 读取 body 做权限/限频/统计（仅 POST JSON；GET/SSE 无 body 跳过）
     let bodyText: string | null = null;
@@ -546,13 +570,19 @@ export default {
         if (body?.method === "tools/call") {
           const tool = body?.params?.name;
           if (tool) {
-            // 付费工具白名单校验
-            if (PAID_TOOLS.includes(tool) && tk.tier !== "admin" && tk.tier !== "pro") {
+            // 付费工具白名单校验（anon 层不可用；PAID_TOOLS 暂空，未来 2-3 个深度工具回填）
+            const canUsePaid =
+              access.kind === "admin" || (access.kind === "token" && access.tier === "pro");
+            if (PAID_TOOLS.includes(tool) && !canUsePaid) {
               return json({ error: "该工具需要 Pro 套餐（contact: lory69060@hotmail.com）" }, 403);
             }
-            // 限频（admin 不限）
-            if (tk.tier !== "admin") {
-              const ok = await rateLimit(env, tk.hash, tk.limit);
+            // 限频（admin 不限；anon 层按日 100 次）
+            if (access.kind === "token" || access.kind === "anon") {
+              const ok = await rateLimit(
+                env,
+                access.kind === "anon" ? "anon" : access.hash,
+                access.kind === "anon" ? ANON_DAILY_LIMIT : access.limit
+              );
               if (!ok) {
                 return new Response("Rate limit exceeded（今日调用次数已用完）", { status: 429, headers: { "Retry-After": "3600" } });
               }
